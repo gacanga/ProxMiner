@@ -1,0 +1,128 @@
+# ProxMiner
+
+**Chercheur de nonces GPU NVIDIA pour Proxima (PROX)**, open source et sans frais, avec un paquet Windows
+prêt à l'emploi : le nœud Proxima, le wallet / mineur `proxi` et le chercheur GPU, branchés ensemble.
+
+*English: [README.md](README.md)*
+
+> **À lire d'abord.** Le réseau Proxima est en **pré-lancement** centralisé : son fondateur peut l'arrêter
+> ou le réinitialiser à tout moment, et les jetons minés ne donnent aucun droit, ne sont pas reportés et
+> disparaissent à une réinitialisation. Le PROX n'a pas de marché. On mine pour l'exercice, à ses risques.
+> ProxMiner n'est pas lié au projet Proxima.
+
+## Ce que c'est
+
+[Proxima](https://lunfardo314.github.io) distribue 94 % de son offre par une **chaîne de minage** : une
+seule sortie chaînée qui avance d'un *transit* par slot d'environ 10 s ; chaque transit paie son mineur.
+Pour produire un transit, il faut un nonce dont la **sortie VRF** sous sa propre clé a au moins *K* bits
+à zéro à la fin :
+
+```
+H     = ECVRF_encode_to_curve_TAI(clé publique, alpha_prefix || nonce)
+Gamma = x * H                                    (x = scalaire secret)
+beta  = SHA-512(0x03 || 0x03 || encode(8 * Gamma) || 0x00)      ECVRF-EDWARDS25519-SHA512-TAI, RFC 9381
+```
+
+Chaque essai coûte un SHA-512, une racine carrée et une multiplication scalaire complète sur Ed25519, sous
+votre clé privée : le travail ne peut pas être mis en commun, le minage se fait en solo.
+
+Le mineur officiel `proxi node mine` suit la chaîne de minage, vérifie, prouve, signe et soumet, et place
+chaque récompense dans le consensus (délégations), que le ledger paie en entier. Il peut confier la
+recherche du nonce à des **chercheurs externes** (« nonce seekers ») par un petit protocole HTTP.
+ProxMiner en est un, pour GPU NVIDIA :
+
+- étape 1, un thread par nonce : SHA-512 du premier essai de hash-to-curve à partir d'un état
+  intermédiaire précalculé par job, décodage du point ; les nonces dont le premier essai n'est pas un
+  point de la courbe sont sautés (jamais soumis) ;
+- étape 2 : Q = 8P, table des multiples impairs, multiplication scalaire wNAF(5) par k = 8x mod L (mêmes
+  chiffres pour tous les threads : aucune divergence), compression, SHA-512, filtre des zéros de fin ;
+- chaque candidat du GPU est recalculé sur le CPU avant l'envoi, avec son `beta`, que le mineur revérifie ;
+  un auto-contrôle du GPU tourne au démarrage et toutes les 10 minutes (code de sortie 6 au moindre écart).
+
+Environ **0,8 à 0,9 MH/s par NVIDIA P104-100** (Pascal), selon les fréquences.
+
+## Paquet Windows (zip de la release)
+
+| Fichier | Rôle |
+|---|---|
+| `proxminer.exe`, `pxgpu.dll`, `cudart64_12.dll` | le chercheur GPU (CUDA 12, sm_61 + PTX) |
+| `proxima.exe` | nœud Proxima, compilé sans modification depuis [lunfardo314/proxima](https://github.com/lunfardo314/proxima) v1.3.8p1 (commit `cb30e5a`), licence MIT (`LICENSE-PROXIMA.txt`) |
+| `proxi.exe` | wallet / outil d'administration / mineur officiel Proxima, même source |
+| `setup.bat`, `setup_seeker.ps1` | configuration du nœud, wallet de minage, connexion du chercheur |
+| `check_clock.bat` | contrôle de l'horloge (Proxima exige une horloge synchronisée, bien sous 80 ms) |
+| `start_node.bat`, `start_mine.bat`, `seeker_loop.bat`, `stop_mine.bat` | lancer / arrêter |
+| `test.bat`, `bench.bat` | test de justesse GPU, banc de 30 s |
+| DLL du runtime VC++ | nécessaires à `pxgpu.dll` |
+
+Il faut : Windows 10/11 x64, un GPU NVIDIA avec un pilote pour CUDA 12 (Pascal ou plus récent), un SSD
+avec quelques Go libres, une horloge synchronisée par NTP.
+
+### Démarrage rapide
+
+1. Décompressez dans un dossier à part. Lancez `test.bat` : il doit finir par `TEST ALL OK`. `bench.bat`
+   donne la vitesse.
+2. Lancez `check_clock.bat`. L'écart doit être proche de 0 (moins de 0,05 s). Si le service Temps Windows
+   ne tourne pas, activez *Régler l'heure automatiquement* (Paramètres > Heure et langue) puis
+   *Synchroniser maintenant*.
+3. Lancez `setup.bat` :
+   - il écrit `node\proxima.yaml` (les nœuds publics Proxima comme pairs et sources d'instantané, API sur
+     127.0.0.1:8000 — si le port 8000 est pris sur votre machine, changez `api.port` ici et `api.node_url`
+     dans `wallet\proxi.yaml`) ;
+   - il crée le wallet de minage : répondez **N** à la question du chiffrement (ProxMiner lit la clé en
+     clair ; sinon, mettez la graine de 32 octets en hexadécimal dans la variable d'environnement
+     `NONCE_SEEKER_SEED`) ;
+   - il règle `mine.seeker.listen` (127.0.0.1:8100) et un `mine.seeker.token` aléatoire dans le profil,
+     et écrit `seeker.txt` pour le chercheur.
+4. Lancez `start_node.bat` et attendez que le nœud soit synchronisé : `node\proxima.log` affiche
+   `latest reliable branch is 1 slots behind`. Au premier démarrage, les nœuds publics peuvent refuser
+   l'instantané quelques minutes (trop récent) : le nœud réessaie tout seul.
+5. Lancez `start_mine.bat`. Il démarre `proxi node mine --workers 0 --stream <nœuds publics>` et le
+   chercheur dans une seconde fenêtre (tous les GPU ; mettez par exemple `--gpus 0,1` dans `gpus.txt` pour
+   choisir). Le chercheur affiche sa vitesse toutes les 30 s ; `proxi` affiche les tours et les transits
+   gagnés.
+6. `stop_mine.bat` arrête le mineur et le chercheur (il termine tous les processus `proxi.exe` et
+   `proxminer.exe`).
+
+### À garder en tête
+
+- **La clé.** Le chercheur a besoin de la clé privée : minez avec un wallet dédié, sauvegardez
+  `wallet\proxima.key`, gardez le dossier privé.
+- **Mises à jour.** Le ledger indique la version de mineur qu'il attend. Quand `proxi` affiche
+  *update proxi*, prenez un `proxi.exe` (et un `proxima.exe`) plus récents auprès du projet Proxima ;
+  ProxMiner continue de fonctionner tant que le protocole des chercheurs et la fonction de travail ne
+  changent pas.
+- **Réinitialisations du réseau.** Après une réinitialisation, arrêtez le nœud, supprimez
+  `node\proximadb` et `node\proximadb.txstore`, puis relancez (voir la documentation Proxima).
+- L'API du nœud n'a pas d'authentification : laissez-la sur 127.0.0.1.
+
+## Ligne de commande
+
+```
+proxminer --proxi http://127.0.0.1:8100 --token T --key-file wallet\proxima.key [--gpus 0,1] [--log seeker.log]
+proxminer --test [--gpus ...]          GPU contre la référence CPU, puis sortie
+proxminer --bench 30 [--gpus ...]      banc sur un job synthétique, puis sortie
+```
+
+Autres options : `--name`, `--batch-ms` (temps GPU par lot, 300 par défaut), `--tpb1/--tpb2/--blocks2`
+(géométrie de lancement), `--selfcheck MIN`, `--args-file F`. Codes de sortie : 2 options/clé, 3 pas de
+GPU, 4 erreur CUDA, 6 auto-contrôle en échec.
+
+## Compilation
+
+- Moteur GPU `pxgpu.dll` : CUDA 12.9 + Visual Studio 2022 (`windows\build_gpu_dll.bat`).
+- Hôte `proxminer.exe` : g++ MSYS2 MINGW64 (`windows/build_host.sh`). `build_all.bat` compile les deux
+  dans `dev\` puis lance le test.
+- Tests sans GPU (Linux ou MSYS2) :
+  - `g++ -O2 -std=gnu++17 -Igpu tests/core_test.cpp -o core_test && ./core_test cases.txt` — vecteurs
+    RFC 9381 et chemin rapide contre la référence générique ;
+  - `python3 tests/ref_vrf.py --check cases.txt` — les mêmes cas recalculés par une implémentation
+    Python indépendante ;
+  - `tests/px_stub.cpp` (remplaçant CPU de `pxgpu.dll`) + `tests/fake_proxi.py` (faux serveur de jobs de
+    `proxi node mine`) — test de bout en bout du chercheur.
+- `proxima.exe` / `proxi.exe` : `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w"`
+  dans le dépôt Proxima (`.` et `./proxi`).
+
+## Licence
+
+ProxMiner : Apache-2.0 (`LICENSE`). Aucun frais de développement. Proxima (`proxima.exe`, `proxi.exe`) :
+MIT, © Evaldas Drasutis (`LICENSE-PROXIMA.txt`).

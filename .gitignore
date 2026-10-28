@@ -1,0 +1,12 @@
+dev/
+rel/
+logs/
+run/
+node/
+wallet/
+seeker.txt
+*.key
+*.exe
+*.dll
+*.lib
+*.exp
