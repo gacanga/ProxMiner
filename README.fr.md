@@ -39,7 +39,11 @@ ProxMiner en est un, pour GPU NVIDIA :
 - chaque candidat du GPU est recalculé sur le CPU avant l'envoi, avec son `beta`, que le mineur revérifie ;
   un auto-contrôle du GPU tourne au démarrage et toutes les 10 minutes (code de sortie 6 au moindre écart).
 
-Environ **0,8 à 0,9 MH/s par NVIDIA P104-100** (Pascal), selon les fréquences.
+L'arithmétique modulo 2^255 - 19 est écrite en PTX avec chaînes de retenues (8 mots de 32 bits, carré
+dédié), appelée comme de vraies fonctions sur le GPU pour que la multiplication scalaire tienne dans le
+cache d'instructions.
+
+Environ **1,3 à 1,4 MH/s par NVIDIA P104-100** (Pascal), selon les fréquences (0.1.0 : 0,8 à 0,9).
 
 ## Paquet Windows (zip de la release)
 
@@ -118,7 +122,11 @@ GPU, 4 erreur CUDA, 6 auto-contrôle en échec.
   - `python3 tests/ref_vrf.py --check cases.txt` — les mêmes cas recalculés par une implémentation
     Python indépendante ;
   - `tests/px_stub.cpp` (remplaçant CPU de `pxgpu.dll`) + `tests/fake_proxi.py` (faux serveur de jobs de
-    `proxi node mine`) — test de bout en bout du chercheur.
+    `proxi node mine`) — test de bout en bout du chercheur ;
+  - `python3 tests/ptx_sim.py gpu/fe_ptx.h` — l'arithmétique PTX exécutée par un petit interpréteur et
+    comparée aux entiers Python. `gpu/fe_ptx.h` est généré par `python3 tools/gen_fe_ptx.py > gpu/fe_ptx.h`.
+- Options de compilation : `-DPX_FE_C` (arithmétique C portable sur le GPU), `-DPX_FE_INLINE`
+  (fonctions arithmétiques en ligne ; plus lent sur Pascal).
 - `proxima.exe` / `proxi.exe` : `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w"`
   dans le dépôt Proxima (`.` et `./proxi`).
 

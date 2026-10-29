@@ -24,9 +24,9 @@
 #  define PXC static inline
 #endif
 
-/* fe_mul / fe_sq: inlined by default; -DPX_FE_NOINLINE makes them real calls on the GPU
-   (much smaller code: the whole scalar multiplication then fits the instruction cache) */
-#if defined(__CUDACC__) && defined(PX_FE_NOINLINE)
+/* fe_mul / fe_sq: real calls on the GPU by default (much smaller code: the scalar multiplication
+   then fits the instruction cache; P104-100: 1 376 kH/s against 670 inlined); -DPX_FE_INLINE inlines them */
+#if defined(__CUDACC__) && !defined(PX_FE_INLINE)
 #  define PX_FEFN __host__ __device__ __noinline__
 #else
 #  define PX_FEFN PXF
@@ -36,12 +36,21 @@
 
 typedef struct { uint32_t v[8]; } fe;
 
+/* GPU: inline PTX with carry chains (tools/gen_fe_ptx.py); -DPX_FE_C keeps the portable C on the GPU */
+#if defined(__CUDACC__) && !defined(PX_FE_C)
+#include "fe_ptx.h"
+#define PX_USE_PTX 1
+#endif
+
 PXF void fe_copy(fe &r, const fe &a) { for (int i = 0; i < 8; i++) r.v[i] = a.v[i]; }
 PXF void fe_set_small(fe &r, uint32_t x) { r.v[0] = x; for (int i = 1; i < 8; i++) r.v[i] = 0; }
 
 /* r = a + b */
 PXF void fe_add(fe &r, const fe &a, const fe &b)
 {
+#if defined(__CUDA_ARCH__) && defined(PX_USE_PTX)
+	fe_add_ptx(r, a, b); return;
+#endif
 	uint64_t c = 0;
 	for (int i = 0; i < 8; i++) { c += (uint64_t)a.v[i] + b.v[i]; r.v[i] = (uint32_t)c; c >>= 32; }
 	/* 2^256 = 38 (mod p): fold the carry twice (the second fold cannot carry again) */
@@ -53,6 +62,9 @@ PXF void fe_add(fe &r, const fe &a, const fe &b)
 /* r = a - b */
 PXF void fe_sub(fe &r, const fe &a, const fe &b)
 {
+#if defined(__CUDA_ARCH__) && defined(PX_USE_PTX)
+	fe_sub_ptx(r, a, b); return;
+#endif
 	int64_t t = 0;
 	for (int i = 0; i < 8; i++) { t += (int64_t)a.v[i] - b.v[i]; r.v[i] = (uint32_t)t; t >>= 32; }
 	/* borrow -> r + 2^256 was stored: subtract 38, twice at most */
@@ -76,6 +88,9 @@ PXF void fe_reduce512(fe &r, const uint32_t t[16])
 /* r = a * b */
 PX_FEFN void fe_mul(fe &r, const fe &a, const fe &b)
 {
+#if defined(__CUDA_ARCH__) && defined(PX_USE_PTX)
+	fe_mul_ptx(r, a, b); return;
+#endif
 	uint32_t t[16];
 	{
 		uint64_t c = 0;
@@ -93,6 +108,9 @@ PX_FEFN void fe_mul(fe &r, const fe &a, const fe &b)
 /* r = a^2 */
 PX_FEFN void fe_sq(fe &r, const fe &a)
 {
+#if defined(__CUDA_ARCH__) && defined(PX_USE_PTX)
+	fe_sq_ptx(r, a); return;
+#endif
 	uint32_t t[16];
 	for (int i = 0; i < 16; i++) t[i] = 0;
 	/* cross products a[i]*a[j], i < j */
