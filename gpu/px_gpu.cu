@@ -1,11 +1,14 @@
 /**
  * ProxMiner - CUDA engine (pxgpu.dll / linked object), NVIDIA Pascal sm_61 and later.
  *   stage 1 (k_stage1): one thread per nonce counter: SHA-512 of the first hash-to-curve try from the
- *            job midstate, point decoding (one square root); decodable ones are appended to a buffer
- *            (warp-aggregated atomics), the others are skipped.
- *   stage 2 (k_stage2): grid-stride over the buffer: Q = 8P, odd-multiple table, wNAF(5) scalar
+ *            job midstate and a Jacobi-symbol test of the point equation (no exponentiation); counters
+ *            whose hash is a curve point are appended to a buffer (warp-aggregated atomics), the others
+ *            (about half) are skipped.
+ *   stage 2 (k_stage2): grid-stride over the buffer: point decoding (one square root, always succeeds),
+ *            Q = 8P, odd-multiple table, wNAF(5) scalar
  *            multiplication by k = 8x mod L (same digits for every thread: no divergence),
- *            compression (one inversion), SHA-512 -> beta; counters with >= k trailing zero bits
+ *            compression with one inversion per PX_BATCH points (Montgomery's trick), SHA-512 -> beta;
+ *            counters with >= k trailing zero bits
  *            are returned (the host recomputes and checks each one).
  * License: Apache-2.0.
  */
@@ -22,7 +25,7 @@
 #define PX_TPB2 128
 #endif
 #ifndef PX_MINB2
-#define PX_MINB2 1
+#define PX_MINB2 8            /* 128 threads x 8 blocks per SM: at most 64 registers, best on P104-100 */
 #endif
 
 __constant__ px_job c_job;
@@ -30,7 +33,7 @@ __constant__ px_key c_key;
 
 struct px_item {
 	uint64_t counter;
-	fe x, y;
+	fe y;                     /* y of the ctr = 0 hash, sign of x in bit 255 */
 };
 
 struct px_ctx {
@@ -51,9 +54,13 @@ __global__ void __launch_bounds__(PX_TPB1) k_stage1(uint64_t base, uint32_t n, p
 {
 	uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
 	uint64_t c = (base + idx) & PX_MASK56;
-	fe x, y;
+	fe y;
+	uint32_t sign = 0;
 	bool ok = false;
-	if (idx < n) ok = px_stage1(c_job, c, x, y);
+	if (idx < n) {
+		px_stage1_y(c_job, c, y, sign);
+		ok = ge_y_ok(y);
+	}
 	unsigned mask = __ballot_sync(0xffffffffu, ok);
 	if (mask == 0) return;
 	int lane = threadIdx.x & 31;
@@ -65,7 +72,7 @@ __global__ void __launch_bounds__(PX_TPB1) k_stage1(uint64_t base, uint32_t n, p
 		uint32_t my = pos + (uint32_t)__popc(mask & ((1u << lane) - 1u));
 		px_item &it = items[my];
 		it.counter = c;
-		it.x = x;
+		y.v[7] |= sign << 31;
 		it.y = y;
 	}
 }
@@ -75,29 +82,59 @@ __global__ void __launch_bounds__(PX_TPB2, PX_MINB2) k_stage2(const px_item *ite
 	uint32_t n = count[0];
 	uint32_t k = c_job.k;
 	uint64_t kmask = k >= 64 ? ~0ULL : ((1ULL << k) - 1ULL);
-	for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-		fe x = items[i].x, y = items[i].y;
-		uint64_t beta[8];
-		px_stage2(c_key, x, y, beta);
-		if ((beta[7] & kmask) == 0 && (k <= 64 || (beta[6] & ((1ULL << (k - 64)) - 1ULL)) == 0)) {
-			uint32_t s = atomicAdd(&count[1], 1u);
-			if ((int)s < max_found) found[s] = items[i].counter;
+	uint32_t stride = gridDim.x * blockDim.x;
+	uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+	/* each thread takes its items tid, tid + stride, ... in groups of PX_BATCH (one inversion per group);
+	   every item passed the Jacobi pre-test, so its point decoding succeeds: no idle lanes */
+	for (uint32_t m0 = 0;; m0 += PX_BATCH) {
+		fe xs[PX_BATCH], ys[PX_BATCH];
+		uint32_t idx[PX_BATCH];
+		int cnt = 0;
+		for (int j = 0; j < PX_BATCH; j++) {
+			uint32_t i = tid + (m0 + (uint32_t)j) * stride;
+			if (i >= n) break;
+			fe y = items[i].y;
+			uint32_t sign = y.v[7] >> 31;
+			y.v[7] &= 0x7fffffffu;
+			fe x;
+			if (!ge_decode_xy(x, y, sign)) continue;      /* cannot happen after ge_y_ok */
+			xs[cnt] = x; ys[cnt] = y; idx[cnt] = i; cnt++;
 		}
+		if (cnt > 0) {
+			uint64_t beta[PX_BATCH][8];
+			px_stage2_batch(c_key, xs, ys, cnt, beta);
+			for (int j = 0; j < cnt; j++) {
+				if ((beta[j][7] & kmask) == 0 && (k <= 64 || (beta[j][6] & ((1ULL << (k - 64)) - 1ULL)) == 0)) {
+					uint32_t s = atomicAdd(&count[1], 1u);
+					if ((int)s < max_found) found[s] = items[idx[j]].counter;
+				}
+			}
+		}
+		if (tid + (m0 + PX_BATCH) * stride >= n) break;
 	}
 }
 
+/* test: thread t takes counters t*B .. t*B+B-1 (B = PX_BATCH), stage 1 for each, stage 2 batched over the valid ones */
 __global__ void k_debug(uint64_t base, uint32_t n, uint8_t *valid, uint8_t *betas)
 {
-	uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-	if (idx >= n) return;
-	uint64_t c = (base + idx) & PX_MASK56;
-	fe x, y;
-	bool ok = px_stage1(c_job, c, x, y);
-	valid[idx] = ok ? 1 : 0;
-	uint64_t beta[8];
-	if (ok) px_stage2(c_key, x, y, beta);
-	else for (int i = 0; i < 8; i++) beta[i] = 0;
-	px_beta_bytes(betas + 64ull * idx, beta);
+	uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+	uint32_t i0 = t * PX_BATCH;
+	if (i0 >= n) return;
+	fe xs[PX_BATCH], ys[PX_BATCH];
+	uint32_t pos[PX_BATCH];
+	int cnt = 0;
+	for (int j = 0; j < PX_BATCH && i0 + j < n; j++) {
+		uint32_t i = i0 + j;
+		uint64_t c = (base + i) & PX_MASK56;
+		fe x, y;
+		bool ok = px_stage1(c_job, c, x, y);
+		valid[i] = ok ? 1 : 0;
+		for (int q = 0; q < 64; q++) betas[64ull * i + q] = 0;
+		if (ok) { xs[cnt] = x; ys[cnt] = y; pos[cnt] = i; cnt++; }
+	}
+	uint64_t beta[PX_BATCH][8];
+	px_stage2_batch(c_key, xs, ys, cnt, beta);
+	for (int j = 0; j < cnt; j++) px_beta_bytes(betas + 64ull * pos[j], beta[j]);
 }
 
 /* ------------------------------------------------------------------ API */
@@ -224,7 +261,8 @@ PX_API int px_debug(void *ctx, uint64_t base, uint32_t count, uint8_t *valid, ui
 		if ((e = cudaMalloc(&c->d_betas, 64ull * count)) != cudaSuccess) return (int)e;
 		c->dbg_cap = count;
 	}
-	k_debug<<<(count + 127) / 128, 128>>>(base, count, c->d_valid, c->d_betas);
+	uint32_t nthreads = (count + PX_BATCH - 1) / PX_BATCH;
+	k_debug<<<(nthreads + 127) / 128, 128>>>(base, count, c->d_valid, c->d_betas);
 	if ((e = cudaGetLastError()) != cudaSuccess) return (int)e;
 	if ((e = cudaMemcpy(valid, c->d_valid, count, cudaMemcpyDeviceToHost)) != cudaSuccess) return (int)e;
 	if ((e = cudaMemcpy(betas, c->d_betas, 64ull * count, cudaMemcpyDeviceToHost)) != cudaSuccess) return (int)e;

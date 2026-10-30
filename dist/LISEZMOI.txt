@@ -32,18 +32,23 @@ recherche du nonce à des **chercheurs externes** (« nonce seekers ») par un p
 ProxMiner en est un, pour GPU NVIDIA :
 
 - étape 1, un thread par nonce : SHA-512 du premier essai de hash-to-curve à partir d'un état
-  intermédiaire précalculé par job, décodage du point ; les nonces dont le premier essai n'est pas un
-  point de la courbe sont sautés (jamais soumis) ;
-- étape 2 : Q = 8P, table des multiples impairs, multiplication scalaire wNAF(5) par k = 8x mod L (mêmes
-  chiffres pour tous les threads : aucune divergence), compression, SHA-512, filtre des zéros de fin ;
+  intermédiaire précalculé par job, et test de Jacobi de l'équation du point (sans exponentiation) ; les
+  nonces dont le premier essai n'est pas un point de la courbe (environ la moitié) sont sautés (jamais
+  soumis) ;
+- étape 2, sur les seuls nonces restants (aucun thread inactif) : décodage du point (racine carrée),
+  Q = 8P, table des multiples impairs, multiplication scalaire wNAF(5) par k = 8x mod L (mêmes chiffres pour
+  tous les threads : aucune divergence), compression avec une inversion partagée pour 16 points, SHA-512,
+  filtre des zéros de fin ;
 - chaque candidat du GPU est recalculé sur le CPU avant l'envoi, avec son beta, que le mineur revérifie ;
   un auto-contrôle du GPU tourne au démarrage et toutes les 10 minutes (code de sortie 6 au moindre écart).
 
 L'arithmétique modulo 2^255 - 19 est écrite en PTX avec chaînes de retenues (8 mots de 32 bits, carré
-dédié), appelée comme de vraies fonctions sur le GPU pour que la multiplication scalaire tienne dans le
-cache d'instructions.
+dédié), appelée comme de vraies fonctions qui prennent et rendent des valeurs : la multiplication scalaire
+tient dans le cache d'instructions et les opérandes restent dans les registres ; l'étape 2 tourne avec
+64 registres par thread.
 
-Environ **1,3 à 1,4 MH/s par NVIDIA P104-100** (Pascal), selon les fréquences (0.1.0 : 0,8 à 0,9).
+Environ **1,9 à 2,1 MH/s par NVIDIA P104-100** (Pascal), selon les fréquences (0.2.0 : 1,3 à 1,4 ; 0.1.0 :
+0,8 à 0,9).
 
 ## Paquet Windows (zip de la release)
 
@@ -125,8 +130,10 @@ GPU, 4 erreur CUDA, 6 auto-contrôle en échec.
     proxi node mine) — test de bout en bout du chercheur ;
   - python3 tests/ptx_sim.py gpu/fe_ptx.h — l'arithmétique PTX exécutée par un petit interpréteur et
     comparée aux entiers Python. gpu/fe_ptx.h est généré par python3 tools/gen_fe_ptx.py > gpu/fe_ptx.h.
-- Options de compilation : -DPX_FE_C (arithmétique C portable sur le GPU), -DPX_FE_INLINE
-  (fonctions arithmétiques en ligne ; plus lent sur Pascal).
+- Options de compilation : -DPX_FE_C (arithmétique C portable sur le GPU), -DPX_FE_REF (fonctions
+  arithmétiques par référence, comportement 0.2.0), -DPX_FE_INLINE (fonctions en ligne), -DPX_BATCH=n
+  (points par inversion partagée, 16 par défaut), -DPX_MINB2=n (blocs de 128 threads par SM en étape 2,
+  8 par défaut).
 - proxima.exe / proxi.exe : GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w"
   dans le dépôt Proxima (. et ./proxi).
 

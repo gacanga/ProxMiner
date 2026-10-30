@@ -75,6 +75,54 @@ int main(int argc, char **argv)
 	}
 	if (out) fclose(out);
 	printf("fast path: %d valid, %d skipped (ctr 0 not a point): %s\n", valid, invalid, fails ? "FAILED" : "OK");
+
+	/* Jacobi symbol against Euler's criterion w^((p-1)/2), and the batched stage 2 */
+	{
+		std::mt19937_64 r2(777);
+		int bad = 0, sq = 0, n = 20000;
+		for (int it = 0; it < n; it++) {
+			fe w;
+			for (int i = 0; i < 8; i++) w.v[i] = (uint32_t)r2();
+			if (it == 0) fe_set_small(w, 0);
+			if (it == 1) fe_set_small(w, 1);
+			if (it == 2) { fe_set_small(w, 0); fe one; fe_set_small(one, 1); fe_sub(w, w, one); }
+			fe_canon(w, w);
+			/* e = (p-1)/2 = 2^254 - 10 : square-and-multiply over its bits, high to low */
+			fe acc; fe_set_small(acc, 1);
+			for (int b = 253; b >= 0; b--) {
+				fe_sq(acc, acc);
+				/* bits of 2^254 - 10 = 0x3fff...fff6 : all ones except bit 0 and bit 3 */
+				bool bit = !(b == 0 || b == 3);
+				if (bit) fe_mul(acc, acc, w);
+			}
+			fe_canon(acc, acc);
+			int euler;
+			fe one; fe_set_small(one, 1);
+			uint32_t z = 0, o = 0;
+			for (int i = 0; i < 8; i++) { z |= acc.v[i]; o |= acc.v[i] ^ one.v[i]; }
+			euler = z == 0 ? 0 : (o == 0 ? 1 : -1);
+			int j = fe_jacobi(w);
+			if (j != euler) { if (bad < 3) printf("jacobi %d euler %d\n", j, euler); bad++; }
+			sq += j == 1;
+		}
+		CHECK(bad == 0, "jacobi: %d differences", bad);
+		printf("jacobi: %d values, %d squares, %d differences\n", n, sq, bad);
+		/* batch */
+		uint8_t seed[32]; for (auto &b : seed) b = (uint8_t)r2();
+		px_secret sec; px_secret_from_seed(sec, seed);
+		uint8_t prefix[37]; for (auto &b : prefix) b = (uint8_t)r2();
+		px_job job; px_make_job(job, sec.pk, prefix, 37, 7, 0);
+		fe xs[PX_BATCH], ys[PX_BATCH];
+		int got = 0, bb = 0;
+		for (uint64_t c = 1000; got < PX_BATCH; c++) { fe x, y; if (px_stage1(job, c, x, y)) { xs[got] = x; ys[got] = y; got++; } }
+		for (int cnt = 1; cnt <= PX_BATCH; cnt++) {
+			uint64_t bw[PX_BATCH][8];
+			px_stage2_batch(sec.key, xs, ys, cnt, bw);
+			for (int i = 0; i < cnt; i++) { uint64_t one[8]; px_stage2(sec.key, xs[i], ys[i], one); bb += memcmp(one, bw[i], sizeof one) != 0; }
+		}
+		CHECK(bb == 0, "batch: %d differences", bb);
+		printf("batch stage 2: cnt 1..%d, %d differences\n", PX_BATCH, bb);
+	}
 	printf(fails ? "CORE TEST FAILED (%d)\n" : "CORE TEST ALL OK\n", fails);
 	return fails ? 1 : 0;
 }

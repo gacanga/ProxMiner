@@ -22,7 +22,7 @@
 #include <sstream>
 #include <algorithm>
 
-#define PX_VERSION "0.2.0"
+#define PX_VERSION "0.3.0"
 
 static std::atomic<bool> g_stop(false);
 

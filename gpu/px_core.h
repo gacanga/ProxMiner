@@ -15,6 +15,9 @@
  */
 #pragma once
 #include <stdint.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 #if defined(__CUDACC__)
 #  define PXF __host__ __device__ __forceinline__
@@ -24,9 +27,16 @@
 #  define PXC static inline
 #endif
 
-/* fe_mul / fe_sq: real calls on the GPU by default (much smaller code: the scalar multiplication
-   then fits the instruction cache; P104-100: 1 376 kH/s against 670 inlined); -DPX_FE_INLINE inlines them */
-#if defined(__CUDACC__) && !defined(PX_FE_INLINE)
+/* fe_mul / fe_sq on the GPU (P104-100, 30 s benchmark):
+     default        real functions taking and returning values: operands stay in registers (0.3.0)
+     -DPX_FE_REF    real functions taking references: operands go through local memory (0.2.0, -25 %)
+     -DPX_FE_INLINE inlined: the scalar multiplication overflows the instruction cache (-60 %) */
+#if defined(__CUDACC__) && !defined(PX_FE_INLINE) && !defined(PX_FE_REF)
+#  ifndef PX_FE_BYVAL
+#    define PX_FE_BYVAL 1
+#  endif
+#endif
+#if defined(__CUDACC__) && !defined(PX_FE_INLINE) && !defined(PX_FE_BYVAL)
 #  define PX_FEFN __host__ __device__ __noinline__
 #else
 #  define PX_FEFN PXF
@@ -40,6 +50,13 @@ typedef struct { uint32_t v[8]; } fe;
 #if defined(__CUDACC__) && !defined(PX_FE_C)
 #include "fe_ptx.h"
 #define PX_USE_PTX 1
+#endif
+
+/* GPU field multiplication / squaring as real functions taking and returning values
+   (operands in registers instead of local memory) */
+#if defined(__CUDACC__) && defined(PX_FE_BYVAL) && defined(PX_USE_PTX)
+__device__ __noinline__ fe fe_mul_v(fe a, fe b) { fe r; fe_mul_ptx(r, a, b); return r; }
+__device__ __noinline__ fe fe_sq_v(fe a) { fe r; fe_sq_ptx(r, a); return r; }
 #endif
 
 PXF void fe_copy(fe &r, const fe &a) { for (int i = 0; i < 8; i++) r.v[i] = a.v[i]; }
@@ -88,7 +105,9 @@ PXF void fe_reduce512(fe &r, const uint32_t t[16])
 /* r = a * b */
 PX_FEFN void fe_mul(fe &r, const fe &a, const fe &b)
 {
-#if defined(__CUDA_ARCH__) && defined(PX_USE_PTX)
+#if defined(__CUDA_ARCH__) && defined(PX_USE_PTX) && defined(PX_FE_BYVAL)
+	r = fe_mul_v(a, b); return;
+#elif defined(__CUDA_ARCH__) && defined(PX_USE_PTX)
 	fe_mul_ptx(r, a, b); return;
 #endif
 	uint32_t t[16];
@@ -108,7 +127,9 @@ PX_FEFN void fe_mul(fe &r, const fe &a, const fe &b)
 /* r = a^2 */
 PX_FEFN void fe_sq(fe &r, const fe &a)
 {
-#if defined(__CUDA_ARCH__) && defined(PX_USE_PTX)
+#if defined(__CUDA_ARCH__) && defined(PX_USE_PTX) && defined(PX_FE_BYVAL)
+	r = fe_sq_v(a); return;
+#elif defined(__CUDA_ARCH__) && defined(PX_USE_PTX)
 	fe_sq_ptx(r, a); return;
 #endif
 	uint32_t t[16];
@@ -310,6 +331,68 @@ PXF void ge_sub(ge_p1p1 &r, const ge_p3 &p, const ge_cached &q)
 	fe_add(r.T, t0, r.T);
 }
 
+
+/*
+ * Jacobi symbol (a / p) for a canonical a in [0, p): 1 (non-zero square), -1 (non-square), 0 (a = 0).
+ * Binary algorithm on 8 x 32-bit limbs (shifts, compares, subtractions only): about 7x cheaper than
+ * the exponentiation that the square root needs, so the half of the nonces whose first hash is not a
+ * point is rejected cheaply.  -DPX_NO_JACOBI turns the pre-test off.
+ */
+PXF uint32_t px_ctz32(uint32_t x)
+{
+#if defined(__CUDA_ARCH__)
+	return (uint32_t)(__ffs((int)x) - 1);
+#elif defined(_MSC_VER)
+	unsigned long i;
+	_BitScanForward(&i, x);
+	return (uint32_t)i;
+#else
+	return (uint32_t)__builtin_ctz(x);
+#endif
+}
+
+PXF int fe_jacobi(const fe &a_in)
+{
+	uint32_t a[8], n[8];
+	for (int i = 0; i < 8; i++) a[i] = a_in.v[i];
+	/* n = p = 2^255 - 19 */
+	n[0] = 0xffffffedu; for (int i = 1; i < 7; i++) n[i] = 0xffffffffu; n[7] = 0x7fffffffu;
+	int t = 1;
+	for (;;) {
+		uint32_t nz = 0;
+		for (int i = 0; i < 8; i++) nz |= a[i];
+		if (nz == 0) break;
+		/* remove whole zero words (rare), then the trailing zero bits of the low word */
+		while (a[0] == 0) {
+			for (int i = 0; i < 7; i++) a[i] = a[i + 1];
+			a[7] = 0;
+			/* shifting by 32 bits (even): no sign change */
+		}
+		uint32_t sh = px_ctz32(a[0]);
+		if (sh) {
+			for (int i = 0; i < 7; i++) a[i] = (a[i] >> sh) | (a[i + 1] << (32 - sh));
+			a[7] >>= sh;
+			uint32_t n8 = n[0] & 7u;
+			if ((sh & 1u) && (n8 == 3u || n8 == 5u)) t = -t;
+		}
+		/* a, n odd: if a < n, swap them (quadratic reciprocity) */
+		int lt = 0, decided = 0;
+		for (int i = 7; i >= 0; i--) {
+			if (!decided && a[i] != n[i]) { lt = a[i] < n[i]; decided = 1; }
+		}
+		if (lt) {
+			if ((a[0] & 3u) == 3u && (n[0] & 3u) == 3u) t = -t;
+			for (int i = 0; i < 8; i++) { uint32_t x = a[i]; a[i] = n[i]; n[i] = x; }
+		}
+		/* a = a - n (even) */
+		int64_t br = 0;
+		for (int i = 0; i < 8; i++) { br += (int64_t)a[i] - n[i]; a[i] = (uint32_t)br; br >>= 32; }
+	}
+	uint32_t one = n[0] ^ 1u;
+	for (int i = 1; i < 8; i++) one |= n[i];
+	return one == 0 ? t : 0;
+}
+
 /*
  * Point decoding exactly as filippo.io/edwards25519 Point.SetBytes (used by the miner):
  * y = 255 low bits (a non-canonical y >= p is accepted and reduced), x = sqrt(u / v) with
@@ -347,6 +430,24 @@ PXF bool ge_decode_xy(fe &x, const fe &y, uint32_t sign)
 	if ((r.v[0] & 1u) != sign) { fe_neg(r, r); fe_canon(r, r); }
 	fe_copy(x, r);
 	return true;
+}
+
+/*
+ * Cheap pre-test of ge_decode_xy: true when y is the y of a curve point (u / v is a square or u = 0),
+ * by the Jacobi symbol of u v (no exponentiation).  ge_decode_xy then always succeeds.
+ */
+PXF bool ge_y_ok(const fe &y)
+{
+	const fe d = PX_FE_D;
+	fe one, u, v, w;
+	fe_set_small(one, 1);
+	fe_sq(u, y);
+	fe_mul(v, u, d);
+	fe_sub(u, u, one);
+	fe_add(v, v, one);
+	fe_mul(w, u, v);
+	fe_canon(w, w);
+	return fe_jacobi(w) >= 0;
 }
 
 /* 32-byte encoding of p (y little-endian, bit 255 = parity of x) as 8 little-endian limbs */
@@ -475,8 +576,8 @@ typedef struct {
 #define PX_WNAF_W   5
 #define PX_TABLE_N  8         /* odd multiples 1, 3, ..., 15 */
 
-/* stage 1: nonce counter -> decoded point (x, y) of the ctr = 0 hash, or false */
-PXF bool px_stage1(const px_job &job, uint64_t counter, fe &x, fe &y)
+/* stage 1a: nonce counter -> y (255 bits) and sign bit of the ctr = 0 hash */
+PXF void px_stage1_y(const px_job &job, uint64_t counter, fe &y, uint32_t &sign)
 {
 	uint64_t s[8], w[16];
 	for (int i = 0; i < 8; i++) s[i] = job.mid[i];
@@ -488,8 +589,18 @@ PXF bool px_stage1(const px_job &job, uint64_t counter, fe &x, fe &y)
 	y.v[2] = px_bswap32((uint32_t)(h1 >> 32)); y.v[3] = px_bswap32((uint32_t)h1);
 	y.v[4] = px_bswap32((uint32_t)(h2 >> 32)); y.v[5] = px_bswap32((uint32_t)h2);
 	y.v[6] = px_bswap32((uint32_t)(h3 >> 32)); y.v[7] = px_bswap32((uint32_t)h3);
-	uint32_t sign = y.v[7] >> 31;
+	sign = y.v[7] >> 31;
 	y.v[7] &= 0x7fffffffu;
+}
+
+/* stage 1: nonce counter -> decoded point (x, y) of the ctr = 0 hash, or false */
+PXF bool px_stage1(const px_job &job, uint64_t counter, fe &x, fe &y)
+{
+	uint32_t sign;
+	px_stage1_y(job, counter, y, sign);
+#if !defined(PX_NO_JACOBI)
+	if (!ge_y_ok(y)) return false;
+#endif
 	return ge_decode_xy(x, y, sign);
 }
 
@@ -533,8 +644,8 @@ PXF void px_table(ge_cached tab[PX_TABLE_N], const ge_p3 &Q)
 	}
 }
 
-/* stage 2: decoded point (x, y) -> R = k * 8 * P (projective) -> beta words */
-PXF void px_stage2(const px_key &key, const fe &x, const fe &y, uint64_t beta[8])
+/* stage 2, first part: decoded point (x, y) -> R = k * 8 * P, projective (X : Y : Z) */
+PXF void px_stage2_proj(const px_key &key, const fe &x, const fe &y, ge_p2 &R)
 {
 	ge_p2 p2; ge_p1p1 t; ge_p3 Q;
 	/* Q = 8 P */
@@ -558,10 +669,59 @@ PXF void px_stage2(const px_key &key, const fe &x, const fe &y, uint64_t beta[8]
 		if (dg > 0) { ge_p1p1_to_p3(r3, t); ge_add(t, r3, tab[(dg - 1) >> 1]); }
 		else if (dg < 0) { ge_p1p1_to_p3(r3, t); ge_sub(t, r3, tab[(-dg - 1) >> 1]); }
 	}
-	ge_p1p1_to_p2(p2, t);
+	ge_p1p1_to_p2(R, t);
+}
+
+/* stage 2, second part: (X, Y) and 1/Z -> encoding -> beta words */
+PXF void px_stage2_finish(const fe &X, const fe &Y, const fe &zinv, uint64_t beta[8])
+{
+	fe x, y;
+	fe_mul(x, X, zinv);
+	fe_mul(y, Y, zinv);
+	fe_canon(x, x);
+	fe_canon(y, y);
 	uint32_t enc[8];
-	ge_encode_p2(enc, p2);
+	for (int i = 0; i < 8; i++) enc[i] = y.v[i];
+	enc[7] |= (x.v[0] & 1u) << 31;
 	px_beta_words(beta, enc);
+}
+
+/* stage 2 for one point (one inversion) */
+PXF void px_stage2(const px_key &key, const fe &x, const fe &y, uint64_t beta[8])
+{
+	ge_p2 R;
+	px_stage2_proj(key, x, y, R);
+	fe zi;
+	fe_invert(zi, R.Z);
+	px_stage2_finish(R.X, R.Y, zi, beta);
+}
+
+/*
+ * Stage 2 for cnt <= PX_BATCH points with one shared inversion (Montgomery's trick:
+ * 3 multiplications per point instead of an inversion).  beta[i] for point i.
+ */
+#ifndef PX_BATCH
+#define PX_BATCH 16
+#endif
+PXF void px_stage2_batch(const px_key &key, const fe *xs, const fe *ys, int cnt, uint64_t beta[][8])
+{
+	fe X[PX_BATCH], Y[PX_BATCH], Z[PX_BATCH], pre[PX_BATCH];
+	for (int i = 0; i < cnt; i++) {
+		ge_p2 R;
+		px_stage2_proj(key, xs[i], ys[i], R);
+		X[i] = R.X; Y[i] = R.Y; Z[i] = R.Z;
+		if (i == 0) pre[0] = R.Z;
+		else fe_mul(pre[i], pre[i - 1], R.Z);
+	}
+	if (cnt <= 0) return;
+	fe inv;
+	fe_invert(inv, pre[cnt - 1]);
+	for (int i = cnt - 1; i >= 0; i--) {
+		fe zi;
+		if (i > 0) { fe_mul(zi, inv, pre[i - 1]); fe_mul(inv, inv, Z[i]); }
+		else zi = inv;
+		px_stage2_finish(X[i], Y[i], zi, beta[i]);
+	}
 }
 
 /* trailing zero bits of beta, counted from the least significant bit of beta[63] (= low byte of word 7) */

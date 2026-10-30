@@ -4,7 +4,7 @@ REM build_gpu_dll.bat - builds <dir>\pxgpu.dll (CUDA engine of ProxMiner) with n
 REM   Target : NVIDIA P104-100 (Pascal, sm_61) + PTX, CUDA 12.9, Visual Studio 2022.
 REM   Output : <dir>\pxgpu.dll, pxgpu.lib, cudart64_12.dll   (dir = %1, default dev)
 REM   Env    : PX_NVCC_EXTRA = extra nvcc flags (build_all.bat reads run\nvcc_extra.txt),
-REM            e.g. -DPX_FE_C  -DPX_FE_INLINE  -DPX_TPB2=64
+REM            e.g. -DPX_FE_REF  -DPX_BATCH=8  -DPX_MINB2=4
 REM   Log    : logs\build_gpu_dll.log
 REM ===========================================================================
 setlocal EnableExtensions
